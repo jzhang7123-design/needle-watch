@@ -8,7 +8,8 @@ What it does
   * appends rows to data/photos.csv. That file feeds the Colab notebook.
 
 What it never does: log in, submit guesses, buy anything, or hit the site more than a few requests per run.
-It refuses to start unless you set CONTACT_EMAIL and PERMISSION_CONFIRMED=yes (you attest the site said OK).
+It refuses to start unless PERMISSION_CONFIRMED=yes (you attest the site said OK). CONTACT_EMAIL is optional;
+if set, it is added to the User-Agent so the site can reach you.
 
 Honesty about timing: "first seen" is when this script noticed a photo, NOT when it was released or taken.
 It lags the real release by up to one polling interval (plus scheduler delay). The first run can't know when the
@@ -151,9 +152,9 @@ def append_rows(path, fields, rows):
 # ------------------------------------------------------------------ one run
 def main():
     base = os.environ.get("SITE_BASE", "https://needle.global").rstrip("/")
-    contact = os.environ.get("CONTACT_EMAIL", "").strip()
-    if not contact or "@" not in contact:
-        log("Set CONTACT_EMAIL (your email). It goes in the User-Agent so the site can reach you.")
+    contact = os.environ.get("CONTACT_EMAIL", "").strip()      # optional
+    if contact and "@" not in contact:
+        log("CONTACT_EMAIL does not look like an email address. Fix it or leave it empty.")
         return EXIT_CONFIG
     if os.environ.get("PERMISSION_CONFIRMED", "").strip().lower() != "yes":
         log("Set PERMISSION_CONFIRMED=yes only if the site owners agreed to this monitoring. Not running.")
@@ -167,7 +168,7 @@ def main():
     max_gap = float(os.environ.get("MAX_GAP_MIN", "45"))
     max_live = int(os.environ.get("MAX_LIVE_PER_RUN", "25"))
     pause = float(os.environ.get("REQUEST_PAUSE_S", "1.5"))
-    ua = f"NeedlePhotoWatcher/1.0 (personal research; low rate; contact {contact})"
+    ua = "NeedlePhotoWatcher/1.0 (personal research; low rate" + (f"; contact {contact})" if contact else ")")
 
     started = now_utc()
     try:

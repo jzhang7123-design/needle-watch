@@ -116,8 +116,13 @@ def test_all():
     with tempfile.TemporaryDirectory() as d:
         code, out = run(port, d, PERMISSION_CONFIRMED="no")
         check("refuses without PERMISSION_CONFIRMED=yes", code == 2 and not Site.hits, out)
+        code, out = run(port, d, CONTACT_EMAIL="not-an-email")
+        check("refuses a malformed contact email", code == 2 and not Site.hits, out)
         code, out = run(port, d, CONTACT_EMAIL="")
-        check("refuses without a contact email", code == 2 and not Site.hits, out)
+        check("runs without a contact email", code == 0, out)
+        check("User-Agent still identifies the tool when no email is set",
+              Site.seen_uas and all(u.startswith("NeedlePhotoWatcher/1.0") and "contact" not in u for u in Site.seen_uas))
+        reset()
 
     # 2. first run -> everything is backfill, nothing is timestamped
     reset()
