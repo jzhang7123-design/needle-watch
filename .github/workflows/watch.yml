@@ -22,7 +22,8 @@ jobs:
         env:
           CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
           PERMISSION_CONFIRMED: ${{ vars.PERMISSION_CONFIRMED }}
-        run: python watcher/watch.py
+          DATA_DIR: data
+        run: python watch.py
       - name: Save results back to the repo
         if: always()
         run: |
