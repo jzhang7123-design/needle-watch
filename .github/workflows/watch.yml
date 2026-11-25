@@ -1,33 +1,87 @@
 name: needle-watch
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "7,37 * * * *"      # backup starter only; the real work is the long session below
   workflow_dispatch: {}
 permissions:
   contents: write
+  actions: write
 concurrency:
   group: needle-watch
   cancel-in-progress: false
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install pillow numpy pandas
-      - name: Check for new photos
+      - name: Watch for about 5 hours 45 minutes
+        id: watch
         env:
           CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
           PERMISSION_CONFIRMED: ${{ vars.PERMISSION_CONFIRMED }}
           DATA_DIR: data
-        run: python watch.py
-      - name: Save results back to the repo
-        if: always()
+          POLL_INTERVAL_S: ${{ vars.POLL_INTERVAL_S || '300' }}
         run: |
+          set +e
+          LOOP_SECONDS="${LOOP_SECONDS:-20700}"
+          POLL_INTERVAL_S="${POLL_INTERVAL_S:-300}"
+          MAX_FAILS="${MAX_FAILS:-6}"
+          PYTHON="${PYTHON:-python}"
+          WATCH_SCRIPT="${WATCH_SCRIPT:-watch.py}"
+          SAVE_TO_GIT="${SAVE_TO_GIT:-yes}"
           git config user.name "needle-watch"
           git config user.email "needle-watch@users.noreply.github.com"
-          git add data
-          git diff --cached --quiet || (git commit -m "watch: update photo log" && git pull --rebase -q && git push -q)
+          save() {
+            [ "$SAVE_TO_GIT" = "yes" ] || return 0
+            if [ "${1:-}" != "force" ]; then
+              # state.json changes on every check; only save when the photo logs themselves changed
+              [ -n "$(git status --porcelain -- data/photos.csv data/backfill.csv data/raw_images_sample.txt 2>/dev/null)" ] || return 0
+            fi
+            git add data 2>/dev/null
+            if ! git diff --cached --quiet; then
+              git commit -q -m "watch: update photo log"
+              git pull --rebase -q || git rebase --abort
+              git push -q || echo "warning: could not save results this time"
+            fi
+          }
+          end=$(( $(date +%s) + LOOP_SECONDS ))
+          fails=0
+          polls=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            polls=$((polls + 1))
+            "$PYTHON" "$WATCH_SCRIPT"
+            code=$?
+            case "$code" in
+              0)
+                fails=0
+                ;;
+              2|3)
+                echo "Stopping: exit code $code (setup problem, or the site refused the request)."
+                save force
+                exit "$code"
+                ;;
+              *)
+                fails=$((fails + 1))
+                echo "Problem (exit code $code), $fails in a row."
+                if [ "$fails" -ge "$MAX_FAILS" ]; then
+                  echo "Too many problems in a row. Stopping."
+                  save force
+                  exit "$code"
+                fi
+                ;;
+            esac
+            save
+            sleep "$POLL_INTERVAL_S"
+          done
+          save force
+          echo "Session finished normally after $polls checks."
+      - name: Start the next session
+        if: steps.watch.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run watch.yml
