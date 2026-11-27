@@ -31,7 +31,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 EXIT_OK, EXIT_CONFIG, EXIT_FORBIDDEN, EXIT_FORMAT, EXIT_NETWORK = 0, 2, 3, 4, 5
-LIVE_FIELDS = ["photo", "released_at", "lum", "prev_poll_utc", "source_url"]
+LIVE_FIELDS = ["photo", "released_at", "lum", "prev_poll_utc", "source_url", "time_source"]
 BACKFILL_FIELDS = ["photo", "noted_at", "reason"]
 
 
@@ -86,8 +86,25 @@ def http_get(url, user_agent, timeout=20, max_tries=3):
 
 
 # ------------------------------------------------------------------ parsing the photo list
-def parse_photo_ids(payload):
-    """Return a sorted list of photo numbers from whatever JSON shape the site uses, or None if unrecognised."""
+TIME_KEYS = ("t", "ts", "time", "timestamp", "at", "created", "created_at", "published", "published_at", "date")
+
+
+def to_unix_seconds(v):
+    """Accept seconds or milliseconds since 1970; return seconds, or None if it doesn't look like a time."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    if v > 1e12:
+        v /= 1000.0
+    return v if 9e8 < v < 4.1e9 else None
+
+
+def parse_photo_list(payload):
+    """Return (sorted photo numbers, {photo: unix_time}) from whatever JSON shape the site uses, or None.
+
+    Understands: [1, 2, 3], [{"id": 1}], {"images": [...]}, a bare count, and [[1, 1795117573], [2, ...]] pairs
+    (photo number followed by a unix time).
+    """
     def as_int(v):
         if isinstance(v, bool):
             return None
@@ -101,9 +118,31 @@ def parse_photo_ids(payload):
                     return as_int(v[k])
         return None
 
+    def entry(x):
+        if isinstance(x, (list, tuple)):
+            if len(x) >= 2 and as_int(x[0]) is not None:
+                return as_int(x[0]), to_unix_seconds(x[1])
+            return None
+        if isinstance(x, dict):
+            i = as_int(x)
+            if i is None:
+                return None
+            for k in TIME_KEYS:
+                if k in x:
+                    return i, to_unix_seconds(x[k])
+            return i, None
+        i = as_int(x)
+        return (i, None) if i is not None else None
+
     def from_list(lst):
-        ids = [as_int(x) for x in lst]
-        return sorted(set(i for i in ids if i is not None)) if lst and all(i is not None for i in ids) else None
+        if not lst:
+            return None
+        got = [entry(x) for x in lst]
+        if any(g is None for g in got):
+            return None
+        ids = sorted(set(i for i, _t in got))
+        times = {i: t for i, t in got if t is not None}
+        return ids, times
 
     if isinstance(payload, list):
         return from_list(payload)
@@ -115,8 +154,26 @@ def parse_photo_ids(payload):
                     return got
         for key in ("count", "total", "n", "latest", "last", "max"):    # only a count: assume 1..N
             if key in payload and isinstance(payload[key], int) and not isinstance(payload[key], bool):
-                return list(range(1, payload[key] + 1))
+                return list(range(1, payload[key] + 1)), {}
     return None
+
+
+def parse_photo_ids(payload):
+    got = parse_photo_list(payload)
+    return got[0] if got else None
+
+
+def fetch_brightness(base, ua, i, pause):
+    """Download the smallest available image for photo i. Returns (brightness, url) or (None, None). May raise Forbidden."""
+    for suffix in (f"{i}.t.webp", f"{i}.webp", f"{i}.png"):
+        time.sleep(pause)
+        st, img = http_get(f"{base}/img/{suffix}", ua)
+        if st == 200 and img:
+            try:
+                return brightness(img), f"{base}/img/{suffix}"
+            except Exception as e:  # noqa: BLE001  (unreadable image: try the next size)
+                log(f"photo {i}: could not decode {suffix}: {e}")
+    return None, None
 
 
 def brightness(image_bytes):
@@ -141,9 +198,15 @@ def write_state(path, state):
 
 
 def append_rows(path, fields, rows):
-    new = not os.path.exists(path)
+    """Append rows, keeping the file's existing header if it already has one."""
+    new = True
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, newline="") as f:
+            header = next(csv.reader(f), None)
+        if header:
+            fields, new = header, False
     with open(path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", restval="")
         if new:
             w.writeheader()
         w.writerows(rows)
@@ -185,15 +248,20 @@ def main():
 
     try:
         payload = json.loads(body.decode("utf-8"))
-        ids = parse_photo_ids(payload)
+        parsed = parse_photo_list(payload)
     except (ValueError, UnicodeDecodeError):
-        payload, ids = None, None
+        parsed = None
+    ids, times = parsed if parsed else (None, {})
     if ids is None:
         sample = os.path.join(data_dir, "raw_images_sample.txt")
         with open(sample, "wb") as f:
             f.write(body[:20000])
         log(f"Could not understand the photo list format. Saved a sample to {sample}. Send it to me so I can adapt the parser.")
         return EXIT_FORMAT
+
+    per_poll = int(os.environ.get("CATCHUP_PER_POLL", "10"))
+    if times and sum(1 for i in ids if i in times) >= 0.9 * len(ids):
+        return run_with_site_times(base, ua, ids, times, state, state_path, data_dir, known, started, pause, per_poll)
 
     new_ids = [i for i in ids if i not in known]
     prev_poll = state["last_ok_utc"]
@@ -213,30 +281,52 @@ def main():
         log(f"{len(new_ids)} photos recorded as backfill ({reason}).")
     else:
         for i in new_ids:
-            lum, used = None, None
-            for suffix in (f"{i}.t.webp", f"{i}.webp", f"{i}.png"):
-                time.sleep(pause)
-                try:
-                    st, img = http_get(f"{base}/img/{suffix}", ua)
-                except Forbidden as e:
-                    log(f"Image request refused ({e}). Stopping without recording photo {i}.")
-                    _commit(data_dir, state_path, state, known, live_rows, back_rows, prev_poll, started, partial=True)
-                    return EXIT_FORBIDDEN
-                if st == 200 and img:
-                    try:
-                        lum, used = brightness(img), f"{base}/img/{suffix}"
-                        break
-                    except Exception as e:  # noqa: BLE001  (unreadable image: try the next size)
-                        log(f"photo {i}: could not decode {suffix}: {e}")
+            try:
+                lum, used = fetch_brightness(base, ua, i, pause)
+            except Forbidden as e:
+                log(f"Image request refused ({e}). Stopping without recording photo {i}.")
+                _commit(data_dir, state_path, state, known, live_rows, back_rows, prev_poll, started, partial=True)
+                return EXIT_FORBIDDEN
             if lum is None:
                 log(f"photo {i}: image not available yet; will retry next run (not marked as seen).")
                 continue
             live_rows.append({"photo": i, "released_at": iso(now_utc()), "lum": f"{lum:.2f}",
-                              "prev_poll_utc": prev_poll or "", "source_url": used})
+                              "prev_poll_utc": prev_poll or "", "source_url": used, "time_source": "first_seen"})
             log(f"new photo {i}: brightness {lum:.1f}")
 
     _commit(data_dir, state_path, state, known, live_rows, back_rows, prev_poll, started)
     log(f"done: {len(ids)} photos listed, {len(live_rows)} new live, {len(back_rows)} backfill.")
+    return EXIT_OK
+
+
+def run_with_site_times(base, ua, ids, times, state, state_path, data_dir, known, started, pause, per_poll):
+    """The site's own photo list gives each photo's time, so no guessing from when we noticed it.
+
+    Each run fetches the small thumbnails of up to `per_poll` photos not yet recorded (newest first) and writes one row
+    each. The first runs therefore work through the backlog gradually, instead of one big burst of requests.
+    """
+    done = set(state.get("done", []))
+    pending = sorted((i for i in ids if i not in done and i in times), reverse=True)
+    rows = []
+    for i in pending[:per_poll]:
+        try:
+            lum, used = fetch_brightness(base, ua, i, pause)
+        except Forbidden as e:
+            log(f"Image request refused ({e}). Stopping.")
+            state["done"] = sorted(done | {int(r["photo"]) for r in rows})
+            _commit(data_dir, state_path, state, known, rows, [], None, started, partial=True)
+            return EXIT_FORBIDDEN
+        if lum is None:
+            log(f"photo {i}: image not available yet; will retry next run.")
+            continue
+        rows.append({"photo": i, "released_at": iso(datetime.fromtimestamp(times[i], timezone.utc)),
+                     "lum": f"{lum:.2f}", "prev_poll_utc": "", "source_url": used, "time_source": "site"})
+        log(f"photo {i}: site time {rows[-1]['released_at']}, brightness {lum:.1f}")
+    state["done"] = sorted(done | {int(r["photo"]) for r in rows})
+    state["time_mode"] = "site"
+    _commit(data_dir, state_path, state, known, rows, [], None, started)
+    left = len(pending) - len(rows)
+    log(f"done: {len(ids)} photos listed, {len(rows)} recorded this run, {left} still to fetch (using the site's own times).")
     return EXIT_OK
 
 
